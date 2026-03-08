@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mail Capture</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css">
+<script src="https://accounts.google.com/gsi/client"></script>
+<style>
+  body { background:#0f172a; color:#e2e8f0; min-height:100vh; font-family:system-ui,sans-serif; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:12px; }
+  video { width:100%; border-radius:8px; background:#000; display:none; }
+  #preview { width:100%; border-radius:8px; display:none; }
+  #mdOutput { font-family:monospace; font-size:13px; white-space:pre-wrap; background:#0f172a;
+    border:1px solid #334155; border-radius:8px; padding:16px; min-height:80px; display:none; max-height:300px; overflow-y:auto; }
+  .dot { width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px; }
+  .dot-green{background:#22c55e} .dot-orange{background:#f97316} .dot-red{background:#ef4444}
+  .dot-pulse{background:#eab308;animation:p 1s infinite}
+  @keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+  .step-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:#94a3b8; }
+  h5 { color:#f1f5f9; }
+</style>
+</head>
+<body>
+<div class="container py-4" style="max-width:680px">
+
+  <div class="d-flex align-items-center mb-4">
+    <div>
+      <h4 class="mb-0 fw-bold">📬 Mail Capture</h4>
+      <small class="text-muted">Photo → OCR → Google Drive</small>
+    </div>
+    <div class="ms-auto text-end">
+      <button id="authBtn" class="btn btn-sm btn-outline-light">Connect Google Drive</button>
+      <div id="authLabel" class="small text-muted mt-1"></div>
+    </div>
+  </div>
+
+  <!-- Step 1: Capture -->
+  <div class="card p-3 mb-3">
+    <div class="step-label mb-2">Step 1 — Capture</div>
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" style="display:none"></canvas>
+    <img id="preview" alt="Captured email">
+    <div class="d-flex gap-2 flex-wrap mt-2">
+      <button id="startCamBtn" class="btn btn-sm btn-outline-secondary">📷 Start Camera</button>
+      <button id="captureBtn" class="btn btn-sm btn-primary" disabled>Capture Photo</button>
+      <label class="btn btn-sm btn-outline-secondary mb-0">
+        📁 Upload Image <input type="file" accept="image/*" id="fileInput" hidden>
+      </label>
+      <button id="retakeBtn" class="btn btn-sm btn-outline-warning" style="display:none">↩ Retake</button>
+    </div>
+  </div>
+
+  <!-- Step 2: Extract -->
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="step-label">Step 2 — Extract Text</div>
+      <span id="ocrStatus" class="small text-muted"></span>
+    </div>
+    <div id="mdOutput"></div>
+    <button id="processBtn" class="btn btn-primary btn-sm mt-2" disabled>🔍 Extract with Claude</button>
+  </div>
+
+  <!-- Step 3: Save -->
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="step-label">Step 3 — Save to Drive</div>
+      <span id="saveStatus" class="small text-muted"></span>
+    </div>
+    <div id="savePath" class="small text-muted mb-2" style="display:none"></div>
+    <button id="saveBtn" class="btn btn-success btn-sm" disabled>💾 Save to Google Drive</button>
+  </div>
+
+  <div id="logMsg" class="small text-muted text-center"></div>
+</div>
+
+<script>
+const CLIENT_ID = '619433829936-abgc891iub18d615ra0d8ctdpm0r3k03.apps.googleusercontent.com';
+const SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+let accessToken = null, tokenClient = null, stream = null;
+let capturedB64 = null, capturedMediaType = 'image/jpeg';
+let extractedMd = null;
+
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas'), preview = $('preview');
+const startCamBtn = $('startCamBtn'), captureBtn = $('captureBtn');
+const retakeBtn = $('retakeBtn'), processBtn = $('processBtn'), saveBtn = $('saveBtn');
+const authBtn = $('authBtn'), fileInput = $('fileInput');
+const mdOutput = $('mdOutput'), ocrStatus = $('ocrStatus'), saveStatus = $('saveStatus');
+const savePath = $('savePath'), logMsg = $('logMsg'), authLabel = $('authLabel');
+
+function log(msg) { logMsg.textContent = msg; }
+
+function initGIS() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPE,
+    callback: resp => {
+      if (resp.error) { log('Auth error: ' + resp.error); return; }
+      accessToken = resp.access_token;
+      authBtn.textContent = '✅ Drive Connected';
+      authBtn.classList.replace('btn-outline-light', 'btn-outline-success');
+      authLabel.innerHTML = '<span class="dot dot-green"></span>Ready';
+      updateBtns();
+      log('Google Drive connected.');
+    }
+  });
+}
+
+if (typeof google !== 'undefined' && google.accounts) {
+  initGIS();
+} else {
+  const gsiScript = document.querySelector('script[src*="gsi"]');
+  if (gsiScript) gsiScript.addEventListener('load', initGIS);
+}
+
+authBtn.addEventListener('click', () => {
+  if (!tokenClient) { log('GIS not ready — try again in a moment.'); return; }
+  tokenClient.requestAccessToken();
+});
+
+startCamBtn.addEventListener('click', async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.srcObject = stream;
+    video.style.display = 'block';
+    captureBtn.disabled = false;
+    startCamBtn.disabled = true;
+    log('Camera live — aim at the email and click Capture.');
+  } catch(e) {
+    log('Camera error: ' + e.message + '. Try uploading an image instead.');
+  }
+});
+
+captureBtn.addEventListener('click', () => {
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+  capturedB64 = canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
+  capturedMediaType = 'image/jpeg';
+  showPreview(canvas.toDataURL('image/jpeg', 0.92));
+  stopStream();
+  log('Captured! Click Extract to process.');
+  updateBtns();
+});
+
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  capturedMediaType = file.type || 'image/jpeg';
+  const reader = new FileReader();
+  reader.onload = ev => {
+    capturedB64 = ev.target.result.split(',')[1];
+    showPreview(ev.target.result);
+    log('Image loaded. Click Extract to process.');
+    updateBtns();
+  };
+  reader.readAsDataURL(file);
+});
+
+retakeBtn.addEventListener('click', () => {
+  capturedB64 = null; extractedMd = null;
+  preview.style.display = 'none';
+  video.style.display = 'none';
+  mdOutput.style.display = 'none';
+  mdOutput.textContent = '';
+  ocrStatus.textContent = '';
+  savePath.style.display = 'none';
+  saveStatus.textContent = '';
+  retakeBtn.style.display = 'none';
+  startCamBtn.disabled = false;
+  captureBtn.disabled = true;
+  updateBtns();
+  log('');
+});
+
+function showPreview(src) {
+  preview.src = src;
+  preview.style.display = 'block';
+  video.style.display = 'none';
+  retakeBtn.style.display = '';
+}
+
+function stopStream() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+}
+
+processBtn.addEventListener('click', async () => {
+  if (!capturedB64) return;
+  processBtn.disabled = true;
+  ocrStatus.innerHTML = '<span class="dot dot-pulse"></span>Processing...';
+  mdOutput.style.display = 'block';
+  mdOutput.textContent = 'Sending to Claude Vision...';
+  extractedMd = null;
+  updateBtns();
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: capturedMediaType, data: capturedB64 } },
+            { type: 'text', text: `Extract all text from this email screenshot and format as clean Markdown.
+
+Start with a metadata block exactly like this:
+---
+From: [sender name and email]
+To: [recipient]
+Date: [date and time as shown]
+Subject: [subject line]
+---
+
+Then include the full email body below, preserving paragraph breaks.
+If a field is not visible, write Unknown.` }
+          ]
+        }]
+      })
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message);
+    extractedMd = data.content.find(b => b.type === 'text')?.text || '';
+    mdOutput.textContent = extractedMd;
+    ocrStatus.innerHTML = '<span class="dot dot-green"></span>Done';
+    log(accessToken ? 'Ready to save to Drive.' : 'Connect Drive to save.');
+  } catch(e) {
+    mdOutput.textContent = 'Error: ' + e.message;
+    ocrStatus.innerHTML = '<span class="dot dot-red"></span>Failed';
+    log('Extraction error: ' + e.message);
+  }
+  processBtn.disabled = false;
+  updateBtns();
+});
+
+saveBtn.addEventListener('click', async () => {
+  if (!extractedMd || !accessToken) return;
+  saveBtn.disabled = true;
+  saveStatus.innerHTML = '<span class="dot dot-pulse"></span>Saving...';
+
+  try {
+    const fromMatch = extractedMd.match(/^From:\s*(.+)/im);
+    let sender = fromMatch ? fromMatch[1].trim() : 'Unknown';
+    sender = sender.replace(/<[^>]+>/g, '').replace(/[<>:"\/\\|?*\r\n]/g, '').trim().substring(0, 40) || 'Unknown';
+
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth()+1).padStart(2,'0');
+    const dd = String(now.getDate()).padStart(2,'0');
+    const dateStr = `${yyyy}-${mm}-${dd}`;
+    const monthStr = `${yyyy}-${mm}`;
+    const fileName = `${dateStr} - ${sender}.md`;
+
+    const rootId = await getOrCreateFolder('Mail Captures', 'root');
+    const monthId = await getOrCreateFolder(monthStr, rootId);
+    await createFile(fileName, extractedMd, monthId);
+
+    const fullPath = `Mail Captures / ${monthStr} / ${fileName}`;
+    saveStatus.innerHTML = '<span class="dot dot-green"></span>Saved!';
+    savePath.textContent = '📂 ' + fullPath;
+    savePath.style.display = 'block';
+    log('✅ ' + fullPath);
+  } catch(e) {
+    saveStatus.innerHTML = '<span class="dot dot-red"></span>Failed';
+    log('Save error: ' + e.message);
+    saveBtn.disabled = false;
+  }
+});
+
+async function driveReq(url, opts={}) {
+  const res = await fetch(url, {
+    ...opts,
+    headers: { Authorization: `Bearer ${accessToken}`, ...(opts.headers||{}) }
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data;
+}
+
+async function getOrCreateFolder(name, parentId) {
+  const q = `name='${name}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`;
+  const data = await driveReq(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id)`);
+  if (data.files?.length) return data.files[0].id;
+  const folder = await driveReq('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] })
+  });
+  return folder.id;
+}
+
+async function createFile(name, content, parentId) {
+  const meta = { name, mimeType: 'text/markdown', parents: [parentId] };
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+  form.append('file', new Blob([content], { type: 'text/markdown' }));
+  return driveReq('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+    method: 'POST', body: form
+  });
+}
+
+function updateBtns() {
+  processBtn.disabled = !capturedB64;
+  saveBtn.disabled = !extractedMd || !accessToken;
+}
+</script>
+</body>
+</html>
