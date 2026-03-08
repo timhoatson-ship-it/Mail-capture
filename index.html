@@ -12,7 +12,7 @@
   video { width:100%; border-radius:8px; background:#000; display:none; }
   #preview { width:100%; border-radius:8px; display:none; }
   #mdOutput { font-family:monospace; font-size:13px; white-space:pre-wrap; background:#0f172a;
-    border:1px solid #334155; border-radius:8px; padding:16px; min-height:80px; display:none; max-height:300px; overflow-y:auto; }
+    border:1px solid #334155; border-radius:8px; padding:16px; min-height:160px; display:none; max-height:500px; overflow-y:auto; }
   .dot { width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px; }
   .dot-green{background:#22c55e} .dot-orange{background:#f97316} .dot-red{background:#ef4444}
   .dot-pulse{background:#eab308;animation:p 1s infinite}
@@ -42,12 +42,12 @@
     <canvas id="canvas" style="display:none"></canvas>
     <img id="preview" alt="Captured email">
     <div class="d-flex gap-2 flex-wrap mt-2">
-      <button id="startCamBtn" class="btn btn-sm btn-outline-secondary">📷 Start Camera</button>
-      <button id="captureBtn" class="btn btn-sm btn-primary" disabled>Capture Photo</button>
-      <label class="btn btn-sm btn-outline-secondary mb-0">
+      <button id="startCamBtn" class="btn btn-outline-secondary">📷 Start Camera</button>
+      <button id="captureBtn" class="btn btn-primary" disabled>Capture Photo</button>
+      <label class="btn btn-outline-secondary mb-0">
         📁 Upload Image <input type="file" accept="image/*" id="fileInput" hidden>
       </label>
-      <button id="retakeBtn" class="btn btn-sm btn-outline-warning" style="display:none">↩ Retake</button>
+      <button id="retakeBtn" class="btn btn-outline-warning" style="display:none">↩ Retake</button>
     </div>
   </div>
 
@@ -58,7 +58,7 @@
       <span id="ocrStatus" class="small text-muted"></span>
     </div>
     <div id="mdOutput"></div>
-    <button id="processBtn" class="btn btn-primary btn-sm mt-2" disabled>🔍 Extract with Claude</button>
+    <button id="processBtn" class="btn btn-primary mt-2" disabled>🔍 Extract with Claude</button>
   </div>
 
   <!-- Step 3: Save -->
@@ -68,7 +68,7 @@
       <span id="saveStatus" class="small text-muted"></span>
     </div>
     <div id="savePath" class="small text-muted mb-2" style="display:none"></div>
-    <button id="saveBtn" class="btn btn-success btn-sm" disabled>💾 Save to Google Drive</button>
+    <button id="saveBtn" class="btn btn-success" disabled>💾 Save to Google Drive</button>
   </div>
 
   <div id="logMsg" class="small text-muted text-center"></div>
@@ -77,6 +77,7 @@
 <script>
 const CLIENT_ID = '619433829936-abgc891iub18d615ra0d8ctdpm0r3k03.apps.googleusercontent.com';
 const SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const VISION_KEY = 'AIzaSyC7nBVsPuq3hvQXJy2XgKfN0pc_yuZnA9c';
 
 let accessToken = null, tokenClient = null, stream = null;
 let capturedB64 = null, capturedMediaType = 'image/jpeg';
@@ -92,6 +93,7 @@ const savePath = $('savePath'), logMsg = $('logMsg'), authLabel = $('authLabel')
 
 function log(msg) { logMsg.textContent = msg; }
 
+// ── GIS Init ──────────────────────────────────────────
 function initGIS() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
@@ -120,6 +122,7 @@ authBtn.addEventListener('click', () => {
   tokenClient.requestAccessToken();
 });
 
+// ── Camera ────────────────────────────────────────────
 startCamBtn.addEventListener('click', async () => {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
@@ -186,6 +189,7 @@ function stopStream() {
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
 }
 
+// ── Claude OCR ────────────────────────────────────────
 processBtn.addEventListener('click', async () => {
   if (!capturedB64) return;
   processBtn.disabled = true;
@@ -196,38 +200,40 @@ processBtn.addEventListener('click', async () => {
   updateBtns();
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${VISION_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: capturedMediaType, data: capturedB64 } },
-            { type: 'text', text: `Extract all text from this email screenshot and format as clean Markdown.
-
-Start with a metadata block exactly like this:
----
-From: [sender name and email]
-To: [recipient]
-Date: [date and time as shown]
-Subject: [subject line]
----
-
-Then include the full email body below, preserving paragraph breaks.
-If a field is not visible, write Unknown.` }
-          ]
+        requests: [{
+          image: { content: capturedB64 },
+          features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
         }]
       })
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error.message);
-    extractedMd = data.content.find(b => b.type === 'text')?.text || '';
+    const raw = data.responses?.[0]?.fullTextAnnotation?.text || '';
+    if (!raw) throw new Error('No text detected in image');
+
+    // Parse out common email fields from raw text
+    const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+    const find = (...keys) => {
+      for (const k of keys) {
+        const l = lines.find(l => l.toLowerCase().startsWith(k.toLowerCase()));
+        if (l) return l.replace(/^[^:]+:\s*/i, '').trim();
+      }
+      return 'Unknown';
+    };
+    const from    = find('from:', 'from ');
+    const to      = find('to:', 'to ');
+    const date    = find('date:', 'sent:', 'time:');
+    const subject = find('subject:', 're:', 'fwd:');
+
+    // Build markdown
+    extractedMd = `---\nFrom: ${from}\nTo: ${to}\nDate: ${date}\nSubject: ${subject}\n---\n\n${raw}`;
     mdOutput.textContent = extractedMd;
     ocrStatus.innerHTML = '<span class="dot dot-green"></span>Done';
-    log(accessToken ? 'Ready to save to Drive.' : 'Connect Drive to save.');
+    log(accessToken ? 'Ready to save to Drive.' : 'Connect Drive to save, or connect now.');
   } catch(e) {
     mdOutput.textContent = 'Error: ' + e.message;
     ocrStatus.innerHTML = '<span class="dot dot-red"></span>Failed';
@@ -237,6 +243,7 @@ If a field is not visible, write Unknown.` }
   updateBtns();
 });
 
+// ── Drive Save ────────────────────────────────────────
 saveBtn.addEventListener('click', async () => {
   if (!extractedMd || !accessToken) return;
   saveBtn.disabled = true;
@@ -245,6 +252,7 @@ saveBtn.addEventListener('click', async () => {
   try {
     const fromMatch = extractedMd.match(/^From:\s*(.+)/im);
     let sender = fromMatch ? fromMatch[1].trim() : 'Unknown';
+    // Strip email address, keep display name only
     sender = sender.replace(/<[^>]+>/g, '').replace(/[<>:"\/\\|?*\r\n]/g, '').trim().substring(0, 40) || 'Unknown';
 
     const now = new Date();
